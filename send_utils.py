@@ -262,9 +262,10 @@ async def qqofficial_send(
     # 框架收包时缓存的最近一条入站(用户)消息 id; 直发不经 send_by_session,
     # 不会被"Bot 自身出站 id"污染, 因而连续多条消息都能命中有效被动锚点
     msg_id = adapter._session_last_message_id.get(session_id)  # pyright: ignore[reportPrivateUsage]
-    # 复用上游富媒体上传/C2C 发送(仅依赖 self.bot), 借 SimpleNamespace 充当 self;
-    # 经 object 中转规避 reportInvalidCast(两类型无重叠, 此处为有意的鸭子类型)
-    helper = cast(QQOfficialMessageEvent, cast(object, SimpleNamespace(bot=bot)))
+    # upload_group_and_c2c_image / upload_group_and_c2c_media / post_c2c_message
+    # 均为 QQOfficialMessageEvent 的实例方法, 内部仅依赖 self.bot;
+    # 借 SimpleNamespace(bot=bot) 充当 self, 以类方法形式调用.
+    _self = SimpleNamespace(bot=bot)
     payload: dict[str, Any] = {"content": plain_text, "msg_id": msg_id}
 
     if is_group:
@@ -272,14 +273,16 @@ async def qqofficial_send(
         if scene == "group":
             payload["msg_seq"] = random.randint(1, 10000)
             if image_base64:
-                payload["media"] = await helper.upload_group_and_c2c_image(
+                payload["media"] = await QQOfficialMessageEvent.upload_group_and_c2c_image(
+                    _self,
                     image_base64,
                     QQOfficialMessageEvent.IMAGE_FILE_TYPE,
                     group_openid=session_id,
                 )
                 payload["msg_type"] = 7
             if record_file_path:
-                media = await helper.upload_group_and_c2c_media(
+                media = await QQOfficialMessageEvent.upload_group_and_c2c_media(
+                    _self,
                     record_file_path,
                     QQOfficialMessageEvent.VOICE_FILE_TYPE,
                     group_openid=session_id,
@@ -288,7 +291,8 @@ async def qqofficial_send(
                     payload["media"] = media
                     payload["msg_type"] = 7
             if video_file_source:
-                media = await helper.upload_group_and_c2c_media(
+                media = await QQOfficialMessageEvent.upload_group_and_c2c_media(
+                    _self,
                     video_file_source,
                     QQOfficialMessageEvent.VIDEO_FILE_TYPE,
                     group_openid=session_id,
@@ -298,7 +302,8 @@ async def qqofficial_send(
                     payload["msg_type"] = 7
                     payload.pop("msg_id", None)
             if file_source:
-                media = await helper.upload_group_and_c2c_media(
+                media = await QQOfficialMessageEvent.upload_group_and_c2c_media(
+                    _self,
                     file_source,
                     QQOfficialMessageEvent.FILE_FILE_TYPE,
                     file_name=file_name,
@@ -317,14 +322,16 @@ async def qqofficial_send(
     else:
         payload["msg_seq"] = random.randint(1, 10000)
         if image_base64:
-            payload["media"] = await helper.upload_group_and_c2c_image(
+            payload["media"] = await QQOfficialMessageEvent.upload_group_and_c2c_image(
+                _self,
                 image_base64,
                 QQOfficialMessageEvent.IMAGE_FILE_TYPE,
                 openid=session_id,
             )
             payload["msg_type"] = 7
         if record_file_path:
-            media = await helper.upload_group_and_c2c_media(
+            media = await QQOfficialMessageEvent.upload_group_and_c2c_media(
+                _self,
                 record_file_path,
                 QQOfficialMessageEvent.VOICE_FILE_TYPE,
                 openid=session_id,
@@ -333,7 +340,8 @@ async def qqofficial_send(
                 payload["media"] = media
                 payload["msg_type"] = 7
         if video_file_source:
-            media = await helper.upload_group_and_c2c_media(
+            media = await QQOfficialMessageEvent.upload_group_and_c2c_media(
+                _self,
                 video_file_source,
                 QQOfficialMessageEvent.VIDEO_FILE_TYPE,
                 openid=session_id,
@@ -342,7 +350,8 @@ async def qqofficial_send(
                 payload["media"] = media
                 payload["msg_type"] = 7
         if file_source:
-            media = await helper.upload_group_and_c2c_media(
+            media = await QQOfficialMessageEvent.upload_group_and_c2c_media(
+                _self,
                 file_source,
                 QQOfficialMessageEvent.FILE_FILE_TYPE,
                 file_name=file_name,
@@ -351,7 +360,7 @@ async def qqofficial_send(
             if media:
                 payload["media"] = media
                 payload["msg_type"] = 7
-        _ = await helper.post_c2c_message(openid=session_id, **payload)
+        _ = await QQOfficialMessageEvent.post_c2c_message(_self, openid=session_id, **payload)
 
 
 async def del_msg(context: Context, msg: MessageSend) -> None:

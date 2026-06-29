@@ -10,6 +10,9 @@
 """
 
 import asyncio
+import shutil
+import time
+import uuid
 from base64 import b64encode
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -19,9 +22,24 @@ import aiofiles
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.message.components import At, File, Image, Plain, Reply
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.filter.event_message_type import EventMessageType
+
+try:
+    from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
+except ImportError:
+    # AstrBot < 4.26 没有 media_utils 模块; 4.25 中 Image.url 保持原始
+    # HTTP CDN URL, 不会出现 file:// URI, 此 fallback 仅用于防御性解码.
+    import urllib.parse
+
+    def is_file_uri(value: object) -> bool:  # type: ignore[no-redef]
+        return isinstance(value, str) and value.startswith("file:///")
+
+    def file_uri_to_path(file_uri: str) -> str:  # type: ignore[no-redef]
+        path = file_uri.removeprefix("file:///")
+        return urllib.parse.unquote(path)
 
 from .client import GsClient
 from .meta_event import build_meta_receive
@@ -101,6 +119,23 @@ class GsCoreAdapter(Star):
         except OSError as e:
             logger.warning(f"[GsCore] 清理临时目录失败: {e}")
 
+    _TEMP_FILE_TTL = 600  # 秒, 略大于 file_token_service 默认超时(300s)
+
+    def _gc_temp_images(self) -> None:
+        """清理 temp_dir 中超过 TTL 的旧图片文件, 防止长期运行堆积.
+
+        每次转换图片前调用; 仅扫描目录内文件并比较 mtime, 开销极小.
+        正常流程中 gsuid_core 在数秒内下载完毕, 300s token 超时后文件
+        即无用, 600s 足够安全.
+        """
+        cutoff = time.time() - self._TEMP_FILE_TTL
+        try:
+            for f in self.temp_dir.iterdir():
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+        except OSError:
+            pass
+
     def _is_gscore_only_message(self, event: AstrMessageEvent) -> bool:
         if not self.GSCORE_ONLY_PREFIXES:
             return False
@@ -112,24 +147,61 @@ class GsCoreAdapter(Star):
         return any(raw_text.startswith(prefix) for prefix in self.GSCORE_ONLY_PREFIXES)
 
     async def _convert_image(self, image_msg: Image) -> GsMessage | None:
+        """将 Image 组件转换为 core 可消费的 GsMessage(type=image).
+
+        AstrBot 4.26+ PreProcessStage 会把 Image.url/file/path 覆盖为本地临时
+        文件路径; gsuid_core 的部分插件(如 XutheringWavesUID)仅支持 HTTP(S)
+        URL 下载, 不兼容 base64:// 协议. 因此本地路径需通过 file_token_service
+        注册为 HTTP URL 再上报; callback_api_base 未配置时回退 base64.
+        """
         img_path = getattr(image_msg, "path", None) or getattr(image_msg, "url", None)
         if not img_path:
             logger.warning(f"[GsCore] 图片消息缺少路径: {image_msg}")
             return None
 
+        # HTTP URL: 直接使用(PreProcessStage 未覆盖或平台原始 CDN 链接)
         if isinstance(img_path, str) and img_path.startswith("http"):
             return GsMessage(type="image", data=img_path)
 
-        file_path = Path(str(img_path))
-        if not file_path.exists():
-            file_path = Path(__file__).parent / str(img_path)
-        if not file_path.exists():
+        # 本地文件路径: 解析 file:// URI 与纯路径
+        raw_path = str(img_path)
+        if is_file_uri(raw_path):
+            raw_path = file_uri_to_path(raw_path)
+
+        src_path = Path(raw_path)
+        if not src_path.exists():
+            src_path = Path(__file__).parent / raw_path
+        if not src_path.exists():
             logger.warning(f"[GsCore] 图片文件不存在: {img_path}")
             return None
 
+        callback_host = astrbot_config.get("callback_api_base", "")
+        if not callback_host:
+            # callback_api_base 未配置, 回退 base64(gsuid_core 部分插件不兼容)
+            logger.warning(
+                "[GsCore] callback_api_base 未配置, 无法生成图片 HTTP URL, 回退 base64"
+            )
+            return await self._image_to_base64_msg(src_path)
+
+        # 复制到插件 temp_dir: PreProcessStage 临时文件受事件生命周期管理,
+        # 事件结束后会被清理; gsuid_core 异步下载时文件可能已不存在(竞态).
+        # 复制后文件生命周期由插件控制, _gc_temp_images 定期清理过期文件.
+        self._gc_temp_images()
+        dst_path = self.temp_dir / f"img_{uuid.uuid4().hex}.jpg"
+        try:
+            shutil.copy2(str(src_path), str(dst_path))
+        except OSError as e:
+            logger.warning(f"[GsCore] 复制图片到 temp_dir 失败: {e}, 回退 base64")
+            return await self._image_to_base64_msg(src_path)
+
+        token = await file_token_service.register_file(str(dst_path))
+        http_url = f"{callback_host}/api/file/{token}"
+        return GsMessage(type="image", data=http_url)
+
+    async def _image_to_base64_msg(self, file_path: Path) -> GsMessage:
+        """读取本地图片并编码为 base64:// GsMessage(回退路径)."""
         async with aiofiles.open(file_path, "rb") as f:
             img_data = await f.read()
-
         base64_data = b64encode(img_data).decode("utf-8")
         return GsMessage(type="image", data=f"base64://{base64_data}")
 
